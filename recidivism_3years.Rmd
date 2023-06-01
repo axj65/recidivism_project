@@ -1,0 +1,1179 @@
+---
+title: "Recidivism"
+output: "md_document"
+date: "2023-04-27"
+---
+
+```{r setup, include=FALSE}
+
+#Set Directory
+knitr::opts_chunk$set(echo = FALSE, include = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/albertjoe33/mac_only_docs/Projects")
+
+#Load Libraries
+library(knitr)
+library(readr)
+library(tidyverse)
+library(rsample)
+library(caret)
+library(modelr)
+library(parallel)
+library(foreach)
+library(dplyr)
+library(rmarkdown)
+library(lubridate)
+library(mosaic)
+library(gamlr)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(lightgbm)
+library(gbm)
+library(pdp)
+library(lattice)
+library(doParallel)
+library(naivebayes)
+library(lightgbm)
+library(patchwork)
+
+#Load Dataset
+rec <- read_csv("Data/NIJ_recidivism.csv")
+```
+
+
+## Functions
+
+```{r functions}
+
+### Calculate Brier Score Function
+calculate_brier <- function(df) {
+  f <- df$phat
+  y <- as.numeric(df$recidivism_y)
+  n <- nrow(df)
+  
+  brier <- sum((f-y)^2)/n
+  
+  return(brier)
+  }
+
+### Calculate Confusion tables/false positive rate by race and the overall fairness penalty
+calculate_fairness <- function(df) {
+  confusion = table(y = df$recidivism_y, yhat = df$yhat)
+  fpr <- confusion[1,2] / (confusion[1,1] + confusion[1,2])
+  
+  df_black <- df %>% filter(Race == 'BLACK')
+  confusion_black <- table(y = df_black$recidivism_y, yhat = df_black$yhat)
+  fpr_black <- confusion_black[1,2] / (confusion_black[1,1] + confusion_black[1,2])
+  
+  df_white <- df %>% filter(Race == 'WHITE')
+  confusion_white <- table(y = df_white$recidivism_y, yhat = df_white$yhat)
+  fpr_white <- confusion_white[1,2] / (confusion_white[1,1] + confusion_white[1,2])
+  
+  fairness_penalty <- 1 - abs(fpr_black - fpr_white)
+  
+  return(list(
+    confusion = confusion, fpr = fpr,
+    confusion_black = confusion_black, fpr_black = fpr_black,
+    confusion_white = confusion_white, fpr_white = fpr_white,
+    fairness_penalty = fairness_penalty))
+}
+
+#Calculate fairness Score
+calculate_score <- function(BS, FP) {
+  score <- (1 - BS) * FP
+  return(score)
+}
+```
+
+
+## 1. Data Cleaning
+
+```{r clean1}
+# I want to only look at Males
+rec <- rec %>% filter(Gender == "M")
+```
+
+
+```{r clean2}
+#Clean Drug Test Data
+
+#Create categories: 0 if drug test is not positive, 1 if drug test is positive, and 2 if not tested
+  #THC
+rec <- rec %>% 
+  mutate(DrugTests_THC_Positive = if_else(DrugTests_THC_Positive != 0 & !is.na(DrugTests_THC_Positive), 1, DrugTests_THC_Positive))
+rec <- rec %>% 
+  mutate(DrugTests_THC_Positive = replace_na(DrugTests_THC_Positive, 2))
+  #Cocaine
+rec <- rec %>% 
+  mutate(DrugTests_Cocaine_Positive = if_else(DrugTests_Cocaine_Positive != 0 & !is.na(DrugTests_Cocaine_Positive), 1, DrugTests_Cocaine_Positive))
+rec <- rec %>% 
+  mutate(DrugTests_Cocaine_Positive = replace_na(DrugTests_Cocaine_Positive, 2))
+  #Meth
+rec <- rec %>% 
+  mutate(DrugTests_Meth_Positive = if_else(DrugTests_Meth_Positive != 0 & !is.na(DrugTests_Meth_Positive), 1, DrugTests_Meth_Positive))
+rec <- rec %>% 
+  mutate(DrugTests_Meth_Positive = replace_na(DrugTests_Meth_Positive, 2))
+  #Other
+rec <- rec %>% 
+  mutate(DrugTests_Other_Positive = if_else(DrugTests_Other_Positive != 0 & !is.na(DrugTests_Other_Positive), 1, DrugTests_Other_Positive))
+rec <- rec %>% 
+  mutate(DrugTests_Other_Positive = replace_na(DrugTests_Other_Positive, 2))
+
+```
+
+```{r clean3}
+#Clean employment data
+
+#I chose to categorize employed as those who worked more than half the time
+#I imputed Nan as not employed
+rec <- rec %>% 
+  mutate(employed = if_else(Percent_Days_Employed >= 0.5, 1, 0))
+rec <- rec %>% 
+  mutate(employed = if_else(is.na(Percent_Days_Employed), 0, employed))
+
+```
+
+```{r clean4}
+# Remove variables I will not use
+rec <- rec %>% select(-c(Avg_Days_per_DrugTest, Percent_Days_Employed,
+                         Jobs_Per_Year, Gender, Residence_PUMA))
+```
+
+
+```{r clean5}
+#For each Supervision_Risk_Score_First, I want to see the number of Supervision_Level_First in each group
+risk_table <- table(rec$Supervision_Risk_Score_First, rec$Supervision_Level_First)
+risk_table
+
+```
+
+
+
+
+```{r clean6}
+#Clean Supervision Data
+
+#Fill Nan from Supervision_Level_First based on Supervision_Risk_Score_First from table above. Impute value by what is most likely
+rec$Supervision_Level_First <- ifelse(
+  rec$Supervision_Risk_Score_First >= 1 & rec$Supervision_Risk_Score_First <= 5 & is.na(rec$Supervision_Level_First),
+  "Standard", rec$Supervision_Level_First)
+
+rec$Supervision_Level_First <- ifelse(
+  rec$Supervision_Risk_Score_First >= 6 & rec$Supervision_Risk_Score_First <= 8 & is.na(rec$Supervision_Level_First),
+  "High", rec$Supervision_Level_First)
+
+rec$Supervision_Level_First <- ifelse(
+  rec$Supervision_Risk_Score_First >= 9 & rec$Supervision_Risk_Score_First <= 10 & is.na(rec$Supervision_Level_First),
+  "Specialized", rec$Supervision_Level_First)
+
+
+#Fill Nan from Supervision_Risk_Score_First based on Supervision_Level_First from table above. Impute median value by what is most likely
+rec$Supervision_Risk_Score_First <- ifelse(
+  rec$Supervision_Level_First == 'Standard' & is.na(rec$Supervision_Risk_Score_First), 3, rec$Supervision_Risk_Score_First)
+
+rec$Supervision_Risk_Score_First <- ifelse(
+  rec$Supervision_Level_First == 'High' & is.na(rec$Supervision_Risk_Score_First), 7, rec$Supervision_Risk_Score_First)
+
+rec$Supervision_Risk_Score_First <- ifelse(
+  rec$Supervision_Level_First == 'Specialized' & is.na(rec$Supervision_Risk_Score_First), 
+  9, rec$Supervision_Risk_Score_First)
+
+#Drop rows where Supervision_Risk_Score_First is Nan
+#Note: Dropped 274 Rows
+rec <- drop_na(rec, Supervision_Risk_Score_First)
+```
+
+```{r clean7}
+
+#Clean numerical data
+
+#Convert some of the string variables that should be integers to integers
+rec <- rec %>% mutate(Dependents = if_else(Dependents == "3 or more", "3", Dependents))
+rec$Dependents <- as.integer(rec$Dependents)
+
+rec <- rec %>% mutate(
+  Prior_Arrest_Episodes_Felony = if_else(Prior_Arrest_Episodes_Felony == "10 or more", "10", Prior_Arrest_Episodes_Felony))
+rec$Prior_Arrest_Episodes_Felony <- as.integer(rec$Prior_Arrest_Episodes_Felony)
+
+rec <- rec %>% mutate(
+  Prior_Arrest_Episodes_Misd = if_else(Prior_Arrest_Episodes_Misd == "6 or more", "6", Prior_Arrest_Episodes_Misd))
+rec$Prior_Arrest_Episodes_Misd <- as.integer(rec$Prior_Arrest_Episodes_Misd)
+
+rec <- rec %>% mutate(
+  Prior_Arrest_Episodes_Violent = if_else(Prior_Arrest_Episodes_Violent == "3 or more", "3", Prior_Arrest_Episodes_Violent))
+rec$Prior_Arrest_Episodes_Violent <- as.integer(rec$Prior_Arrest_Episodes_Violent)
+
+rec <- rec %>% mutate(
+  Prior_Arrest_Episodes_Property = if_else(
+    Prior_Arrest_Episodes_Property == "5 or more", "5", Prior_Arrest_Episodes_Property))
+rec$Prior_Arrest_Episodes_Property <- as.integer(rec$Prior_Arrest_Episodes_Property)
+
+rec <- rec %>% mutate(
+  Prior_Arrest_Episodes_Drug = if_else(Prior_Arrest_Episodes_Drug == "5 or more", "5", Prior_Arrest_Episodes_Drug))
+rec$Prior_Arrest_Episodes_Drug <- as.integer(rec$Prior_Arrest_Episodes_Drug)
+
+rec <- rec %>% mutate(
+  Prior_Arrest_Episodes_PPViolationCharges = if_else(
+    Prior_Arrest_Episodes_PPViolationCharges == "5 or more", "5", Prior_Arrest_Episodes_PPViolationCharges))
+rec$Prior_Arrest_Episodes_PPViolationCharges <- as.integer(rec$Prior_Arrest_Episodes_PPViolationCharges)
+
+rec <- rec %>% mutate(
+  Prior_Conviction_Episodes_Felony = if_else(
+    Prior_Conviction_Episodes_Felony == "3 or more", "3", Prior_Conviction_Episodes_Felony))
+rec$Prior_Conviction_Episodes_Felony <- as.integer(rec$Prior_Conviction_Episodes_Felony)
+
+rec <- rec %>% mutate(
+  Prior_Conviction_Episodes_Misd = if_else(
+    Prior_Conviction_Episodes_Misd  == "4 or more", "4", Prior_Conviction_Episodes_Misd))
+rec$Prior_Conviction_Episodes_Misd <- as.integer(rec$Prior_Conviction_Episodes_Misd)
+
+rec <- rec %>% mutate(
+  Prior_Conviction_Episodes_Prop = if_else(
+    Prior_Conviction_Episodes_Prop == "3 or more", "3", Prior_Conviction_Episodes_Prop))
+rec$Prior_Conviction_Episodes_Prop <- as.integer(rec$Prior_Conviction_Episodes_Prop)
+
+rec <- rec %>% mutate(
+  Prior_Conviction_Episodes_Drug = if_else(
+    Prior_Conviction_Episodes_Drug == "2 or more", "2", Prior_Conviction_Episodes_Drug))
+rec$Prior_Conviction_Episodes_Drug <- as.integer(rec$Prior_Conviction_Episodes_Drug)
+
+rec <- rec %>% mutate(
+  Delinquency_Reports = if_else(Delinquency_Reports  == "4 or more", "4", Delinquency_Reports))
+rec$Delinquency_Reports <- as.integer(rec$Delinquency_Reports)
+
+rec <- rec %>% mutate(
+  Program_Attendances = if_else(Program_Attendances  == "10 or more", "10", Program_Attendances))
+rec$Program_Attendances <- as.integer(rec$Program_Attendances)
+
+rec <- rec %>% mutate(
+  Program_UnexcusedAbsences = if_else(Program_UnexcusedAbsences  == "3 or more", "3", Program_UnexcusedAbsences))
+rec$Program_UnexcusedAbsences <- as.integer(rec$Program_UnexcusedAbsences)
+
+rec <- rec %>% mutate(
+  Residence_Changes = if_else(Residence_Changes  == "3 or more", "3", Residence_Changes))
+rec$Residence_Changes <- as.integer(rec$Residence_Changes)
+
+rec <- rec %>% mutate(
+  Prison_Years = if_else(Prison_Years  == "Less than 1 year", "1", Prison_Years))
+rec <- rec %>% mutate(
+  Prison_Years = if_else(Prison_Years  == "1-2 years", "2", Prison_Years))
+rec <- rec %>% mutate(
+  Prison_Years = if_else(Prison_Years  == "Greater than 2 to 3 years", "3", Prison_Years))
+rec <- rec %>% mutate(
+  Prison_Years = if_else(Prison_Years  == "More than 3 years", "4", Prison_Years))
+rec$Prison_Years <- as.integer(rec$Prison_Years)
+
+```
+
+```{r clean8}
+#Clean Prison_Offense Data 
+
+#Prison_Offense has over 2000 nan
+#I do not want to lose data so I categorized as unknown
+rec <- rec %>% mutate(Prison_Offense = if_else(is.na(Prison_Offense), "Unknown", Prison_Offense))
+```
+
+```{r clean9}
+#Clean categorical data
+
+#Ensure some variables are factor
+rec$DrugTests_THC_Positive <- factor(rec$DrugTests_THC_Positive)
+rec$DrugTests_Cocaine_Positive <- factor(rec$DrugTests_Cocaine_Positive)
+rec$DrugTests_Meth_Positive <- factor(rec$DrugTests_Meth_Positive)
+rec$DrugTests_Other_Positive <- factor(rec$DrugTests_Other_Positive)
+
+```
+
+
+```{r clean10}
+#Remove variables that are determine before prison release 
+rec <- rec %>% select(-c(Supervision_Risk_Score_First, Supervision_Level_First,
+                         Violations_ElectronicMonitoring, Violations_FailToReport,
+                         Violations_FailToReport, Violations_MoveWithoutPermission,
+                         Delinquency_Reports, Program_Attendances, Program_UnexcusedAbsences,
+                         Residence_Changes, DrugTests_THC_Positive, DrugTests_Cocaine_Positive,
+                         DrugTests_Meth_Positive, DrugTests_Other_Positive, Employment_Exempt, employed))
+
+```
+
+
+## 2. Models
+
+
+```{r model1}
+#I want to predict recidivism within the first 3 years
+rec$recidivism_y <- rec$Recidivism_Within_3years
+
+#Remove the other metrics from dataframe
+rec <- rec %>% select(-c(Recidivism_Arrest_Year1, Recidivism_Arrest_Year2, Recidivism_Arrest_Year3, Recidivism_Within_3years))
+```
+
+
+```{r model2}
+#Hold out validation set
+rec_df <- rec %>% filter(Training_Sample == 1)
+rec_val <- rec %>% filter(Training_Sample == 0)
+
+rec_df <- rec_df %>% select(-c(Training_Sample))
+rec_val <- rec_val %>% select(-c(Training_Sample))
+```
+
+```{r model3}
+#Create 6 folds on training set because training data is divisible by 6
+set.seed(1994)
+K_folds <- 6
+rec_df = rec_df %>%
+  mutate(fold_id = rep(1:K_folds, length=nrow(rec_df)) %>% sample)
+```
+
+
+```{r model4}
+# Before evaluating any models, I want to obtain the base rate
+table(rec_val$recidivism_y)
+1 - mean(rec$recidivism_y)
+```
+
+
+```{r model5}
+#Null Model Scores
+
+rec$recidivism_y <- as.numeric(rec$recidivism_y)
+
+# Brier Score and Model Score if predict the mean
+train_df <- rec_df
+test_df <- rec_val
+
+train_df$phat <- mean(rec_df$recidivism_y)
+test_df$phat <- mean(rec_val$recidivism_y)
+train_df$yhat <- ifelse(train_df$phat > 0.5, 1, 0) 
+test_df$yhat <- ifelse(test_df$phat > 0.5, 1, 0) 
+
+train_brier <- calculate_brier(train_df)
+test_brier <- calculate_brier(test_df)
+
+train_white <- train_df %>% filter(Race=='WHITE')
+train_black <- train_df %>% filter(Race=='BLACK')
+test_white <- test_df %>% filter(Race=='WHITE')
+test_black <- test_df %>% filter(Race=='BLACK')
+
+whitefp_train <- train_white %>% filter(recidivism_y==0 & yhat==1)
+blackfp_train <- train_black %>% filter(recidivism_y==0 & yhat==1)
+whitefp_test <- test_white %>% filter(recidivism_y==0 & yhat==1)
+blackfp_test <- test_black %>% filter(recidivism_y==0 & yhat==1)
+
+fp_train <- 1 - abs(nrow(whitefp_train)/nrow(train_white) - nrow(blackfp_train)/nrow(train_black))
+fp_test <- 1 - abs(nrow(whitefp_test)/nrow(test_white) - nrow(blackfp_test)/nrow(test_black))
+
+train_brier
+test_brier
+(1-train_brier) * fp_train
+(1-test_brier) * fp_test
+```
+
+
+### Naive Bayes
+
+#### 6-Fold Cross-Validation using Training Data
+
+```{r nb1}
+#One-hot encoding for training data
+rec_onehot <- data.frame(model.matrix(recidivism_y~ . -ID -Race -1, data = rec_df))
+rec_onehot$Race <- rec_df$Race
+rec_onehot$ID <- rec_df$ID
+rec_onehot$recidivism_y <- rec_df$recidivism_y
+```
+
+
+```{r nb2}
+
+nb_results <- data.frame(matrix(ncol = ncol(rec_df), nrow = 0))
+colnames(nb_results) <- colnames(rec_df)
+
+set.seed(1994)
+for (i in 1:K_folds) {
+  
+  rec_train <- rec_onehot %>% filter(fold_id != i)
+  rec_test <- rec_onehot %>% filter(fold_id == i)
+  
+  X_train <- data.frame(model.matrix(recidivism_y ~ . -ID -Race -1, data = rec_train))
+  X_test <- data.frame(model.matrix(recidivism_y ~ . -ID -Race -1, data = rec_test))
+    
+  y_train <- rec_train$recidivism_y
+
+  set.seed(1994)
+  nb_model <- naive_bayes(x = X_train, y = y_train)
+  
+  #Predict values for the testing data/fold 
+  phat <- predict(nb_model, newdata = X_test, type = 'prob') %>% round(5)
+  rec_test$phat <- phat[,2]
+  rec_test$yhat <- ifelse(rec_test$phat > 0.5, 1, 0) 
+  
+  #Append the data with predictions to the empty dataframe
+  nb_results <- rbind(nb_results, rec_test)
+}
+```
+
+
+```{r nb3}
+nb_brier <- calculate_brier(nb_results)
+cat("NB in-sample Brier Score (lower is better):", nb_brier, "\n")
+
+nb_fp <- calculate_fairness(nb_results)$fairness_penalty
+cat("NB in-sample Fairness Penalty (higher is better):", nb_fp, "\n")
+
+```
+
+
+```{r nb4}
+model_score <- calculate_score(nb_brier, nb_fp)
+cat("NB in-sample Model Score (higher is better):", model_score, "\n")
+```
+
+```{r nb5}
+calculate_fairness(nb_results)$confusion
+```
+
+
+```{r nb6}
+#Save predictions in case I want to use for stacked model
+nb_results <- nb_results %>% arrange(ID)
+nb_predictions <- nb_results$phat
+```
+
+
+#### Validation
+
+```{r nb7}
+#One-hot encoding for validation set
+rec_val_onehot <- data.frame(model.matrix(recidivism_y~ . -Race -1, data = rec_val))
+rec_val_onehot$Race <- rec_val$Race
+
+rec_val_onehot$recidivism_y <- rec_val$recidivism_y
+```
+
+
+```{r nb8}
+#Prep training and testing/validation data
+X_train <- data.frame(model.matrix(recidivism_y ~ . -ID -fold_id -Race -1, data = rec_onehot))
+X_test <- data.frame(model.matrix(recidivism_y ~ . -ID -Race -1, data = rec_val_onehot))
+    
+y_train <- rec_onehot$recidivism_y
+
+set.seed(1994)
+#Create nb model
+nb_model <- naive_bayes(x = X_train, y = y_train)
+```
+
+
+```{r nb9}
+#Predict values for the validation data
+phat <- predict(nb_model, newdata = X_test, type = 'prob') %>% round(5)
+rec_val$phat <- phat[,2]
+rec_val$yhat <- ifelse(rec_val$phat > 0.5, 1, 0) 
+```
+
+```{r nb10}
+nb_val_brier <- calculate_brier(rec_val)
+cat("NB out-of-sample Brier Score (lower is better):", nb_val_brier, "\n")
+
+nb_val_fp <- calculate_fairness(rec_val)$fairness_penalty
+
+
+```
+
+```{r nb11}
+nb_val_model_score <- calculate_score(nb_val_brier, nb_val_fp)
+cat("NB out-of-sample Model Score (higher is better):", nb_val_model_score, "\n")
+```
+
+```{r nb12}
+#Save predictions in case I want to use for stacked model
+rec_val <- rec_val %>% arrange(ID)
+nb_val_pred <- rec_val$phat
+```
+
+
+```{r nb13}
+nb_conf_test <- calculate_fairness(rec_val)$confusion
+nb_conf_test
+```
+
+#### Plots
+
+```{r nb14}
+# Calibration Plot for NB on Train Set
+
+calibration_data <- data.frame(pred_prob = nb_results$phat, true_class = nb_results$recidivism_y)
+
+colnames(calibration_data)[1] = 'pred_prob'
+
+calibration_data$bin <- cut(calibration_data$pred_prob, seq(0, 1, 0.05))
+calibration_summary <- aggregate(cbind(pred_prob, true_class) ~ bin, data = calibration_data, mean)
+
+# Calibration Plot
+nb_train_plot <- ggplot(calibration_summary, aes(x = pred_prob, y = true_class)) +
+                  geom_line() +
+                  geom_abline(slope = 1, intercept = 0, color = "red") +
+                  labs(x = "Predicted probability", y = "Observed probability", title = "NB Train Calibration Plot") +
+                  coord_cartesian(xlim = c(0,1), ylim = c(0,1))
+```
+
+
+```{r nb15}
+# Calibration Plot for NB on Test Set
+
+calibration_data <- data.frame(pred_prob = rec_val$phat, true_class = rec_val$recidivism_y)
+
+colnames(calibration_data)[1] = 'pred_prob'
+
+calibration_data$bin <- cut(calibration_data$pred_prob, seq(0, 1, 0.05))
+calibration_summary <- aggregate(cbind(pred_prob, true_class) ~ bin, data = calibration_data, mean)
+
+# Calibration Plot
+nb_test_plot <-ggplot(calibration_summary, aes(x = pred_prob, y = true_class)) +
+                geom_line() +
+                geom_abline(slope = 1, intercept = 0, color = "red") +
+                labs(x = "Predicted probability", y = "Observed probability", title = "NB Test Calibration Plot") +
+                coord_cartesian(xlim = c(0,1), ylim = c(0,1))
+```
+
+
+```{r nb16}
+nb_train_hist <- ggplot(nb_results, aes(x = phat)) +
+                  geom_histogram(binwidth=0.05) + 
+                  labs(x = "Predicted Probabilities", y = "Count") + 
+                  ggtitle("NB Train Histogram")
+
+nb_test_hist <- ggplot(rec_val, aes(x = phat)) +
+                  geom_histogram(binwidth=0.05) +
+                  labs(x = "Predicted Probabilities", y = "Count") + 
+                  ggtitle("NB Test Histogram")
+```
+
+### Lasso-logit Model
+
+#### 6-Fold Cross-Validation using Training Data
+
+```{r lasso1}
+
+#Prep lasso training data for lasso regression
+lasso_onehot <- data.frame(model.matrix(recidivism_y~ . -ID -Race -1, data = rec_df))
+lasso_onehot$Race <- rec_df$Race
+lasso_onehot$ID <- rec_df$ID
+lasso_onehot$recidivism_y <- rec_df$recidivism_y
+
+#Prep lasso validation data for lasso regression
+lasso_val_onehot <- data.frame(model.matrix(recidivism_y~ . -ID -Race -phat -yhat -1, data = rec_val))
+lasso_val_onehot$Race <- rec_val$Race
+lasso_val_onehot$ID <- rec_val$ID
+lasso_val_onehot$recidivism_y <- rec_val$recidivism_y
+
+```
+
+```{r lasso2}
+
+#Create empty dataframe so I can append predicted values using cross validation into this dataframe
+lasso_results <- data.frame(matrix(ncol = ncol(rec_df), nrow = 0))
+colnames(nb_results) <- colnames(rec_df)
+
+set.seed(1994)
+for (i in 1:K_folds) {
+  
+  #train-test split
+  lasso_train <- lasso_onehot %>% filter(fold_id != i)
+  lasso_test <- lasso_onehot %>% filter(fold_id == i)
+  
+  X_train <- data.frame(model.matrix(recidivism_y ~ . -ID -Race -1, data = lasso_train))
+  X_test <- data.frame(model.matrix(recidivism_y ~ . -ID -Race -1, data = lasso_test))
+    
+  y_train <- lasso_train$recidivism_y
+
+  #Model
+  set.seed(1994)
+  lasso_model <- gamlr(X_train, y_train, family = "binomial", lambda.min.ratio = 0.0082)
+  
+  #Predict values for the testing data/fold 
+  phat <- predict(lasso_model, newdata = X_test, type = 'response') %>% round(5)
+  lasso_test$phat <- phat
+  lasso_test$yhat <- ifelse(lasso_test$phat > 0.5, 1, 0) 
+  
+  #Append the data with predictions to the empty dataframe
+  lasso_results <- rbind(lasso_results, lasso_test)
+}
+```
+
+```{r lasso3}
+lasso_brier <- calculate_brier(lasso_results)
+cat("Lasso in-sample Brier Score (lower is better):", lasso_brier, "\n")
+
+lasso_fp <- calculate_fairness(lasso_results)$fairness_penalty
+cat("Lasso in-sample Fairness Penalty (higher is better):", lasso_fp, "\n")
+
+```
+
+
+```{r lasso4}
+model_score <- calculate_score(lasso_brier, lasso_fp)
+cat("Lasso in-sample Model Score (higher is better):", model_score, "\n")
+```
+
+```{r lasso5}
+calculate_fairness(lasso_results)$confusion
+```
+
+```{r lasso6}
+#Save predictions in case I want to use for stacked model
+lasso_results <- lasso_results %>% arrange(ID)
+lasso_predictions <- lasso_results$phat
+```
+
+
+#### Validation 
+
+```{r lasso7}
+#Prep the lasso regression data 
+lasso_onehot <- data.frame(model.matrix(recidivism_y~ . -Race -1, data = rec_df))
+lasso_val_onehot <- data.frame(model.matrix(recidivism_y~ . -Race -phat -yhat -1, data = rec_val))
+```
+
+
+```{r lasso8, include=FALSE}
+#Convert to matrix
+lasso_x <- model.matrix(~ . -ID -fold_id -1, data=lasso_onehot)
+lasso_y = rec_df$recidivism_y
+
+#Create matrix for predictions
+val_lasso <- model.matrix(~ . -ID -1, data = lasso_val_onehot)
+
+set.seed(1994)
+#Find optimal lambda.min.ratio using 1SE rule
+fit <- cv.gamlr(lasso_x, lasso_y, nfold = 6)
+
+```
+
+
+```{r lasso9}
+set.seed(1994)
+
+#Train LLR Model
+lasso_glm <- gamlr(lasso_x, lasso_y, family = "binomial", lambda.min.ratio = 0.0082)
+
+#Predict values on validation data 
+phat <- predict(lasso_glm, newdata = val_lasso, type = 'response')
+rec_val$phat <- phat
+rec_val$yhat <- ifelse(rec_val$phat > 0.5, 1, 0) 
+```
+
+
+```{r lasso10}
+lasso_val_brier <- calculate_brier(rec_val)
+cat("Lasso out-of-sample Brier Score (lower is better):", lasso_val_brier, "\n")
+
+lasso_val_fp <- calculate_fairness(rec_val)$fairness_penalty
+cat("Lasso out-of-sample Fairness Penalty (higher is better):", lasso_val_fp, "\n")
+```
+
+```{r lasso11}
+model_score <- calculate_score(lasso_val_brier, lasso_val_fp)
+cat("Lasso out-of-sample Model Score (higher is better):", model_score, "\n")
+```
+
+```{r lasso12}
+lasso_conf_test <- calculate_fairness(rec_val)$confusion
+lasso_conf_test
+```
+
+
+```{r lasso13}
+#Save predictions in case I want to use for stacked model
+rec_val <- rec_val %>% arrange(ID)
+lasso_val_pred <- rec_val$phat
+
+
+#Clean the lasso prediction
+lasso_predictions <- data.frame(lasso_predictions)
+names(lasso_predictions)[1] <- 'lasso'
+
+lasso_val_pred <- data.frame(lasso_val_pred)
+names(lasso_val_pred) [1] <- 'lasso'
+```
+
+```{r lasso14}
+library(openxlsx)
+
+lasso_coef <- coef(lasso_glm)
+lasso_coef_df <- as.data.frame(as.matrix(lasso_coef))
+
+colnames(lasso_coef_df) = 'Coefficients'
+
+lasso_coef_df
+
+#write.xlsx(lasso_coef_df, file = "lasso_year3.xlsx", sheetName = "Sheet1", row.names = TRUE)
+```
+
+
+#### Plots
+
+```{r lasso15}
+# Calibration Plot for LLR on Train Set
+colnames(lasso_results)[44] = 'phat'
+
+calibration_data <- data.frame(pred_prob = lasso_results$phat, true_class = lasso_results$recidivism_y)
+
+colnames(calibration_data)[1] = 'pred_prob'
+
+calibration_data$bin <- cut(calibration_data$pred_prob, seq(0, 1, 0.05))
+calibration_summary <- aggregate(cbind(pred_prob, true_class) ~ bin, data = calibration_data, mean)
+
+# Calibration Plot
+lasso_train_plot <- ggplot(calibration_summary, aes(x = pred_prob, y = true_class)) +
+                      geom_line() +
+                      geom_abline(slope = 1, intercept = 0, color = "red") +
+                      labs(x = "Predicted probability", y = "Observed probability", title = "LLR Train Calibration Plot") +
+                      coord_cartesian(xlim = c(0,1), ylim = c(0,1))
+```
+
+
+```{r lasso16}
+# Calibration Plot on LLR Test Set
+calibration_data <- data.frame(pred_prob = rec_val$phat, true_class = rec_val$recidivism_y)
+
+colnames(calibration_data)[1] = 'pred_prob'
+
+calibration_data$bin <- cut(calibration_data$pred_prob, seq(0, 1, 0.05))
+calibration_summary <- aggregate(cbind(pred_prob, true_class) ~ bin, data = calibration_data, mean)
+
+# Calibration Plot
+lasso_test_plot <-ggplot(calibration_summary, aes(x = pred_prob, y = true_class)) +
+                    geom_line() +
+                    geom_abline(slope = 1, intercept = 0, color = "red") +
+                    labs(x = "Predicted probability", y = "Observed probability", title = "LLR Test Calibration Plot") + 
+                    coord_cartesian(xlim = c(0,1), ylim = c(0,1))
+```
+
+
+```{r lasso17}
+lasso_train_hist <- ggplot(lasso_results, aes(x = phat)) +
+                  geom_histogram(binwidth=0.05) + 
+                  labs(x = "Predicted Probabilities", y = "Count") + 
+                  ggtitle("LLR Train Histogram")
+
+lasso_test_hist <- ggplot(rec_val, aes(x = phat)) +
+                  geom_histogram(binwidth=0.05) +
+                  labs(x = "Predicted Probabilities", y = "Count") + 
+                  ggtitle("LLR Test Histogram")
+
+```
+
+### Random Forest
+
+#### 6-Fold Cross-Validation using Training Data
+
+
+```{r rf1, include=FALSE}
+
+#Create emtpy dataframe to append cross-validated predictions
+rf_results <- data.frame(matrix(ncol = ncol(rec_df), nrow = 0))
+colnames(rf_results) <- colnames(rec_df)
+
+#Ensure code works no matter how many cores CPU has and how many trees are running
+numCores <- detectCores()
+total_ntree <- 1000
+while (total_ntree %% numCores != 0){
+  numCores = numCores - 1
+}
+
+set.seed(1994)
+for (i in 1:K_folds) {
+  
+  #train-test split
+  rf_train <- rec_df %>% filter(fold_id != i)
+  rf_test <- rec_df %>% filter(fold_id == i)
+  
+  #Register the cluster as the parallel backend
+  cl <- makeCluster(numCores)
+  registerDoParallel(cl)
+
+  # Calculate the number of trees per core
+  ntrees_per_core <- total_ntree / numCores
+  set.seed(1994)
+  # Run randomForest with parallel processing
+  rf_model <- foreach(ntree = rep(ntrees_per_core, numCores), .combine = combine, .packages = "randomForest") %dopar% {
+    randomForest(factor(recidivism_y) ~ . -ID -Race, data = rf_train, ntree = ntree)
+  }
+
+  #Predict and calculate phat/yhat
+  phat <- predict(rf_model, newdata = rf_test, type = "prob")
+  rf_test$phat <- phat[,2]
+  rf_test$yhat <- ifelse(rf_test$phat > 0.5, 1, 0) 
+
+  # Stop the cluster
+  stopCluster(cl)
+  
+  #Append the data with predictions to the empty dataframe
+  rf_results <- rbind(rf_results, rf_test)
+}
+```
+
+
+```{r rf2}
+rf_brier <- calculate_brier(rf_results)
+cat("Random Forest in-sample Brier Score (lower is better):", rf_brier, "\n")
+
+rf_fp <- calculate_fairness(rf_results)$fairness_penalty
+cat("Random Forest in-sample Fairness Penalty (higher is better):", rf_fp, "\n")
+```
+
+
+```{r rf3}
+model_score <- calculate_score(rf_brier, rf_fp)
+cat("Random Forest in-sample Model Score (higher is better):", model_score, "\n")
+```
+
+```{r rf4}
+calculate_fairness(rf_results)$confusion
+```
+
+
+```{r rf5}
+#Save predictions in case I want to use for stacked model
+rf_results <- rf_results %>% arrange(ID)
+rf_predictions <- rf_results$phat
+```
+
+
+#### Validation 
+
+```{r rf6}
+#Take out fold_id for validation
+rec_df_no_folds <- rec_df %>% select(-c(fold_id))
+```
+
+
+```{r rf7, include=FALSE}
+
+#Ensure code works no matter how many cores CPU has and how many trees are running
+numCores <- detectCores()
+total_ntree <- 1000
+while (total_ntree %% numCores != 0){
+  numCores = numCores - 1
+}
+
+# Register the cluster as the parallel backend
+cl <- makeCluster(numCores)
+registerDoParallel(cl)
+
+# Calculate the number of trees per core
+ntrees_per_core <- total_ntree / numCores
+
+set.seed(1994)
+# Run randomForest with parallel processing
+rf_model <- foreach(ntree = rep(ntrees_per_core, numCores), .combine = combine, .packages = "randomForest") %dopar% {
+  randomForest(factor(recidivism_y) ~ . -ID -Race, data = rec_df_no_folds, ntree = ntree)
+}
+
+#Predict and calculate phat/yhat
+phat <- predict(rf_model, newdata = rec_val, type = "prob")
+rec_val$phat <- phat[,2]
+rec_val$yhat <- ifelse(rec_val$phat > 0.5, 1, 0) 
+
+# Stop the cluster
+stopCluster(cl)
+```
+
+
+```{r rf8}
+rf_val_brier <- calculate_brier(rec_val)
+cat("Random Forest out-of-sample Brier Score (lower is better):", rf_val_brier, "\n")
+
+rf_val_fp <- calculate_fairness(rec_val)$fairness_penalty
+cat("Random Forest out-of-sample Fairness Penalty (higher is better):", rf_val_fp, "\n")
+```
+
+```{r rf9}
+model_score <- calculate_score(rf_val_brier, rf_val_fp)
+cat("Random Forest out-of-sample Model Score (higher is better):", model_score, "\n")
+```
+
+```{r rf10}
+calculate_fairness(rec_val)$confusion
+```
+
+```{r rf11}
+#Save predictions in case I want to use for stacked model
+rec_val <- rec_val %>% arrange(ID)
+rf_val_pred <- rec_val$phat
+```
+
+
+#### Plots
+
+```{r rf12}
+# Calibration Plot for RF on Train Set
+
+calibration_data <- data.frame(pred_prob = rf_results$phat, true_class = rf_results$recidivism_y)
+
+colnames(calibration_data)[1] = 'pred_prob'
+
+calibration_data$bin <- cut(calibration_data$pred_prob, seq(0, 1, 0.05))
+calibration_summary <- aggregate(cbind(pred_prob, true_class) ~ bin, data = calibration_data, mean)
+
+# Calibration Plot
+rf_train_plot <- ggplot(calibration_summary, aes(x = pred_prob, y = true_class)) +
+                  geom_line() +
+                  geom_abline(slope = 1, intercept = 0, color = "red") +
+                  labs(x = "Predicted probability", y = "Observed probability", title = "RF Train Calibration Plot") +
+                    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1))
+```
+
+```{r rf13}
+# Calibration Plot for RF on Test Set
+
+calibration_data <- data.frame(pred_prob = rec_val$phat, true_class = rec_val$recidivism_y)
+
+colnames(calibration_data)[1] = 'pred_prob'
+
+calibration_data$bin <- cut(calibration_data$pred_prob, seq(0, 1, 0.05))
+calibration_summary <- aggregate(cbind(pred_prob, true_class) ~ bin, data = calibration_data, mean)
+
+# Calibration Plot
+rf_test_plot <- ggplot(calibration_summary, aes(x = pred_prob, y = true_class)) +
+                  geom_line() +
+                  geom_abline(slope = 1, intercept = 0, color = "red") +
+                  labs(x = "Predicted probability", y = "Observed probability", title = "RF Test Calibration Plot") +
+                  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1))
+
+```
+
+
+```{r rf14}
+rf_train_hist <- ggplot(rf_results, aes(x = phat)) +
+                  geom_histogram(binwidth=0.05) + 
+                  labs(x = "Predicted Probabilities", y = "Count") + 
+                  ggtitle("RF Train Histogram")
+
+rf_test_hist <- ggplot(rec_val, aes(x = phat)) +
+                  geom_histogram(binwidth=0.05) +
+                  labs(x = "Predicted Probabilities", y = "Count") + 
+                  ggtitle("RF Test Histogram")
+
+```
+
+### LightGBM Model
+
+#### 6-Fold Cross-Validation using Training Data
+
+
+```{r lgb1}
+#Parameters
+params <- list(
+  objective = "binary",
+  metric = "binary_logloss",
+  num_leaves = 5,
+  learning_rate = 0.1554172850388652,
+  reg_alpha = 0.06766451909430012,
+  reg_lambda = 0.19624464361828178,
+  bagging_fraction = 0.7990114523775765,
+  feature_fraction = 0.9710810081829547,
+  max_depth = 8,
+  boosting_type = 'gbdt'
+)
+
+```
+
+
+
+```{r lgb2, include=FALSE}
+#Create empty dataframe to append cv predictions
+lgb_results <- data.frame(matrix(ncol = ncol(rec_df), nrow = 0))
+colnames(lgb_results) <- colnames(rec_df)
+
+set.seed(1994)
+for (i in 1:K_folds) {
+  
+  #train-test split
+  lgb_train <- rec_df %>% filter(fold_id != i)
+  lgb_test <- rec_df %>% filter(fold_id == i)
+  
+  X_train <- model.matrix(recidivism_y~ . -ID -fold_id -Race -1, data=lgb_train)
+  y_train = lgb_train$recidivism_y
+  train_data <- lgb.Dataset(data = X_train, label = y_train)
+  
+  X_test <- model.matrix(recidivism_y~ . -ID -fold_id -Race -1, data=lgb_test)
+  y_test = lgb_test$recidivism_y
+  test_data <- lgb.Dataset.create.valid(train_data, X_test, label = y_test)
+  
+  set.seed(1994)
+  #model
+  lgb_model <- lgb.train(
+    params = params,
+    data = train_data,
+    num_boost_round = 500,
+    valids = list(val = test_data),
+    early_stopping_rounds = 25
+  )
+  
+  #Predict and calculate phat/yhat
+  phat <- predict(lgb_model, X_test)
+  lgb_test$phat <- phat
+  lgb_test$yhat <- ifelse(lgb_test$phat > 0.5, 1, 0) 
+  
+  #Append the data with predictions to the empty dataframe
+  lgb_results <- rbind(lgb_results, lgb_test)
+}
+```
+
+
+```{r lgb3}
+lgb_brier <- calculate_brier(lgb_results)
+cat("LGB in-sample Brier Score (lower is better):", lgb_brier, "\n")
+
+lgb_fp <- calculate_fairness(lgb_results)$fairness_penalty
+cat("LGB in-sample Fairness Penalty (higher is better):", lgb_fp, "\n")
+```
+
+
+```{r lgb4}
+model_score <- calculate_score(lgb_brier, lgb_fp)
+cat("LGB in-sample Model Score (higher is better):", model_score, "\n")
+```
+
+```{r lgb5}
+calculate_fairness(lgb_results)$confusion
+```
+
+```{r lgb6}
+#Save predictions in case I want to use for stacked model
+lgb_results <- lgb_results %>% arrange(ID)
+lgb_predictions <- lgb_results$phat
+```
+
+#### Validation
+
+```{r lgb7, include=FALSE}
+#Train Model with All Data and Predict on Validation Set
+
+X_train <- model.matrix(recidivism_y~ . -ID -fold_id -Race -1, data=rec_df)
+y_train = rec_df$recidivism_y
+train_data <- lgb.Dataset(data = X_train, label = y_train)
+
+X_test <- model.matrix(recidivism_y~ . -ID -phat -yhat -Race -1, data=rec_val)
+y_test = rec_val$recidivism_y
+test_data <- lgb.Dataset.create.valid(train_data, X_test, label = y_test)
+
+set.seed(1994)
+lgb_model <- lgb.train(params = params,data = train_data, num_boost_round = 200)
+  
+phat <- predict(lgb_model, X_test)
+rec_val$phat <- phat
+rec_val$yhat <- ifelse(rec_val$phat > 0.5, 1, 0) 
+```
+
+
+
+```{r lgb8}
+#booster <- lgb.Booster(lgbm_model)
+
+lgbm_val_brier <- calculate_brier(rec_val)
+cat("LGB out-of-sample Brier Score (lower is better):",lgbm_val_brier, "\n")
+
+lgbm_val_fp <- calculate_fairness(rec_val)$fairness_penalty
+cat("LGB out-of-sample Fairness Penalty (higher is better):", lgbm_val_fp, "\n")
+
+```
+
+
+```{r lgb9}
+model_score <- calculate_score(lgbm_val_brier, lgbm_val_fp)
+cat("LGB in-sample Model Score (higher is better):", model_score, "\n")
+```
+
+```{r lgb10}
+calculate_fairness(rec_val)$confusion
+
+```
+
+
+```{r lgb11}
+#Save predictions in case I want to use for stacked model
+rec_val <- rec_val %>% arrange(ID)
+lgb_val_pred <- rec_val$phat
+```
+
+
+#### Plots
+
+```{r lgb12}
+# Calibration Plot for LGB on Train Set
+
+calibration_data <- data.frame(pred_prob = lgb_results$phat, true_class = lgb_results$recidivism_y)
+
+colnames(calibration_data)[1] = 'pred_prob'
+
+calibration_data$bin <- cut(calibration_data$pred_prob, seq(0, 1, 0.05))
+calibration_summary <- aggregate(cbind(pred_prob, true_class) ~ bin, data = calibration_data, mean)
+
+# Calibration Plot
+lgb_train_plot <- ggplot(calibration_summary, aes(x = pred_prob, y = true_class)) +
+                    geom_line() +
+                    geom_abline(slope = 1, intercept = 0, color = "red") +
+                    labs(x = "Predicted probability", y = "Observed probability", title = "GBDT Train Calibration Plot") +
+                    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1))
+```
+
+
+```{r lgb13}
+# Calibration Plot for LGB on Test Set
+
+calibration_data <- data.frame(pred_prob = rec_val$phat, true_class = rec_val$recidivism_y)
+
+colnames(calibration_data)[1] = 'pred_prob'
+
+calibration_data$bin <- cut(calibration_data$pred_prob, seq(0, 1, 0.05))
+calibration_summary <- aggregate(cbind(pred_prob, true_class) ~ bin, data = calibration_data, mean)
+
+# Calibration Plot
+lgb_test_plot <- ggplot(calibration_summary, aes(x = pred_prob, y = true_class)) +
+                  geom_line() +
+                  geom_abline(slope = 1, intercept = 0, color = "red") +
+                  labs(x = "Predicted probability", y = "Observed probability", title = "GBDT Test Calibration Plot") +
+                  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1))
+```
+
+
+```{r lgb14}
+lgb_train_hist <- ggplot(lgb_results, aes(x = phat)) +
+                  geom_histogram(binwidth=0.05) + 
+                  labs(x = "Predicted Probabilities", y = "Count") + 
+                  ggtitle("GBDT Train Histogram") 
+
+lgb_test_hist <- ggplot(rec_val, aes(x = phat)) +
+                  geom_histogram(binwidth=0.05) +
+                  labs(x = "Predicted Probabilities", y = "Count") + 
+                  ggtitle("GBDT Test Histogram")
+
+```
+
+### Plots
+
+```{r plot1}
+(nb_train_plot + nb_test_plot) / (lasso_train_plot + lasso_test_plot) 
+```
+
+```{r plot2}
+(rf_train_plot + rf_test_plot) / (lgb_train_plot + lgb_test_plot)
+```
+
+
+```{r plot3}
+(nb_train_hist + nb_test_hist) / (lasso_train_hist + lasso_test_hist)
+```
+
+
+```{r plot4}
+(rf_train_hist + rf_test_hist) / (lgb_train_hist + lgb_test_hist)
+```
+
+
+
+
